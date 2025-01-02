@@ -1,485 +1,192 @@
-import React, {
-	createContext,
-	Fragment,
-	useCallback,
-	useContext,
-	useEffect,
-	useMemo,
-	useRef,
-	useState,
-} from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import ReactDOM from 'react-dom';
 import invariant from 'tiny-invariant';
 
-import Avatar from '@atlaskit/avatar';
-import Badge from '@atlaskit/badge';
-import DropdownMenu, { DropdownItem, DropdownItemGroup } from '@atlaskit/dropdown-menu';
-// eslint-disable-next-line @atlaskit/design-system/no-banned-imports
-import mergeRefs from '@atlaskit/ds-lib/merge-refs';
-import Lozenge from '@atlaskit/lozenge';
 import { triggerPostMoveFlash } from '@atlaskit/pragmatic-drag-and-drop-flourish/trigger-post-move-flash';
-import {
-	attachClosestEdge,
-	type Edge,
-	extractClosestEdge,
-} from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
+import { extractClosestEdge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
+import type { Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/types';
 import { getReorderDestinationIndex } from '@atlaskit/pragmatic-drag-and-drop-hitbox/util/get-reorder-destination-index';
 import * as liveRegion from '@atlaskit/pragmatic-drag-and-drop-live-region';
-import { DragHandleButton } from '@atlaskit/pragmatic-drag-and-drop-react-accessibility/drag-handle-button';
-import { DropIndicator } from '@atlaskit/pragmatic-drag-and-drop-react-drop-indicator/box';
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
-import {
-	draggable,
-	dropTargetForElements,
-	monitorForElements,
-} from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
-import { pointerOutsideOfPreview } from '@atlaskit/pragmatic-drag-and-drop/element/pointer-outside-of-preview';
-import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
+import { monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { reorder } from '@atlaskit/pragmatic-drag-and-drop/reorder';
-import { Box, Grid, Inline, Stack, xcss } from '@atlaskit/primitives';
-import { token } from '@atlaskit/tokens';
 
-type ItemPosition = 'first' | 'last' | 'middle' | 'only';
+import { type ColumnMap, type ColumnType, getBasicData, type Person } from './pieces/data';
+import Board from './pieces/board/board';
+import { BoardContext, type BoardContextValue } from './pieces/board/board-context';
+import { Column } from './pieces/board/column';
+import { createRegistry } from './pieces/board/registry';
 
-type CleanupFn = () => void;
+type Outcome =
+	| {
+			type: 'column-reorder';
+			columnId: string;
+			startIndex: number;
+			finishIndex: number;
+	  }
+	| {
+			type: 'card-reorder';
+			columnId: string;
+			startIndex: number;
+			finishIndex: number;
+	  }
+	| {
+			type: 'card-move';
+			finishColumnId: string;
+			itemIndexInStartColumn: number;
+			itemIndexInFinishColumn: number;
+	  };
 
-type ItemEntry = { itemId: string; element: HTMLElement };
+type Trigger = 'pointer' | 'keyboard';
 
-type ListContextValue = {
-	getListLength: () => number;
-	registerItem: (entry: ItemEntry) => CleanupFn;
-	reorderItem: (args: {
-		startIndex: number;
-		indexOfTarget: number;
-		closestEdgeOfTarget: Edge | null;
-	}) => void;
-	instanceId: symbol;
+type Operation = {
+	trigger: Trigger;
+	outcome: Outcome;
 };
 
-const ListContext = createContext<ListContextValue | null>(null);
-
-function useListContext() {
-	const listContext = useContext(ListContext);
-	invariant(listContext !== null);
-	return listContext;
-}
-
-type Item = {
-	id: string;
-	label: string;
+type BoardState = {
+	columnMap: ColumnMap;
+	orderedColumnIds: string[];
+	lastOperation: Operation | null;
 };
 
-const itemKey = Symbol('item');
-type ItemData = {
-	[itemKey]: true;
-	item: Item;
-	index: number;
-	instanceId: symbol;
-};
+export default function BoardExample() {
+	const [data, setData] = useState<BoardState>(() => {
+		const base = getBasicData();
+		return {
+			...base,
+			lastOperation: null,
+		};
+	});
 
-function getItemData({
-	item,
-	index,
-	instanceId,
-}: {
-	item: Item;
-	index: number;
-	instanceId: symbol;
-}): ItemData {
-	return {
-		[itemKey]: true,
-		item,
-		index,
-		instanceId,
-	};
-}
+	const stableData = useRef(data);
+	useEffect(() => {
+		stableData.current = data;
+	}, [data]);
 
-function isItemData(data: Record<string | symbol, unknown>): data is ItemData {
-	return data[itemKey] === true;
-}
+	const [registry] = useState(createRegistry);
 
-function getItemPosition({ index, items }: { index: number; items: Item[] }): ItemPosition {
-	if (items.length === 1) {
-		return 'only';
-	}
-
-	if (index === 0) {
-		return 'first';
-	}
-
-	if (index === items.length - 1) {
-		return 'last';
-	}
-
-	return 'middle';
-}
-
-const listItemContainerStyles = xcss({
-	position: 'relative',
-	backgroundColor: 'elevation.surface',
-	borderWidth: 'border.width.0',
-	borderBottomWidth: token('border.width', '1px'),
-	borderStyle: 'solid',
-	borderColor: 'color.border',
-	// eslint-disable-next-line @atlaskit/ui-styling-standard/no-unsafe-selectors -- Ignored via go/DSP-18766
-	':last-of-type': {
-		borderWidth: 'border.width.0',
-	},
-});
-
-const listItemStyles = xcss({
-	position: 'relative',
-	padding: 'space.100',
-});
-
-const listItemDisabledStyles = xcss({ opacity: 0.4 });
-
-type DraggableState =
-	| { type: 'idle' }
-	| { type: 'preview'; container: HTMLElement }
-	| { type: 'dragging' };
-
-const idleState: DraggableState = { type: 'idle' };
-const draggingState: DraggableState = { type: 'dragging' };
-
-const listItemPreviewStyles = xcss({
-	paddingBlock: 'space.050',
-	paddingInline: 'space.100',
-	borderRadius: 'border.radius.100',
-	backgroundColor: 'elevation.surface.overlay',
-	maxWidth: '360px',
-	whiteSpace: 'nowrap',
-	overflow: 'hidden',
-	textOverflow: 'ellipsis',
-});
-
-const itemLabelStyles = xcss({
-	flexGrow: 1,
-	whiteSpace: 'nowrap',
-	textOverflow: 'ellipsis',
-	overflow: 'hidden',
-});
-
-function DropDownContent({ position, index }: { position: ItemPosition; index: number }) {
-	const { reorderItem, getListLength } = useListContext();
-
-	const isMoveUpDisabled = position === 'first' || position === 'only';
-	const isMoveDownDisabled = position === 'last' || position === 'only';
-
-	const moveToTop = useCallback(() => {
-		reorderItem({
-			startIndex: index,
-			indexOfTarget: 0,
-			closestEdgeOfTarget: null,
-		});
-	}, [index, reorderItem]);
-
-	const moveUp = useCallback(() => {
-		reorderItem({
-			startIndex: index,
-			indexOfTarget: index - 1,
-			closestEdgeOfTarget: null,
-		});
-	}, [index, reorderItem]);
-
-	const moveDown = useCallback(() => {
-		reorderItem({
-			startIndex: index,
-			indexOfTarget: index + 1,
-			closestEdgeOfTarget: null,
-		});
-	}, [index, reorderItem]);
-
-	const moveToBottom = useCallback(() => {
-		reorderItem({
-			startIndex: index,
-			indexOfTarget: getListLength() - 1,
-			closestEdgeOfTarget: null,
-		});
-	}, [index, getListLength, reorderItem]);
-
-	return (
-		<DropdownItemGroup>
-			<DropdownItem onClick={moveToTop} isDisabled={isMoveUpDisabled}>
-				Move to top
-			</DropdownItem>
-			<DropdownItem onClick={moveUp} isDisabled={isMoveUpDisabled}>
-				Move up
-			</DropdownItem>
-			<DropdownItem onClick={moveDown} isDisabled={isMoveDownDisabled}>
-				Move down
-			</DropdownItem>
-			<DropdownItem onClick={moveToBottom} isDisabled={isMoveDownDisabled}>
-				Move to bottom
-			</DropdownItem>
-		</DropdownItemGroup>
-	);
-}
-
-function ListItem({
-	item,
-	index,
-	position,
-}: {
-	item: Item;
-	index: number;
-	position: ItemPosition;
-}) {
-	const { registerItem, instanceId } = useListContext();
-
-	const ref = useRef<HTMLDivElement>(null);
-	const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
-
-	const dragHandleRef = useRef<HTMLButtonElement>(null);
-
-	const [draggableState, setDraggableState] = useState<DraggableState>(idleState);
+	const { lastOperation } = data;
 
 	useEffect(() => {
-		const element = ref.current;
-		const dragHandle = dragHandleRef.current;
-		invariant(element);
-		invariant(dragHandle);
+		if (lastOperation === null) {
+			return;
+		}
+		const { outcome, trigger } = lastOperation;
 
-		const data = getItemData({ item, index, instanceId });
+		if (outcome.type === 'column-reorder') {
+			const { startIndex, finishIndex } = outcome;
 
-		return combine(
-			registerItem({ itemId: item.id, element }),
-			draggable({
-				element: dragHandle,
-				getInitialData: () => data,
-				onGenerateDragPreview({ nativeSetDragImage }) {
-					setCustomNativeDragPreview({
-						nativeSetDragImage,
-						getOffset: pointerOutsideOfPreview({
-							x: token('space.200', '16px'),
-							y: token('space.100', '8px'),
-						}),
-						render({ container }) {
-							setDraggableState({ type: 'preview', container });
+			const { columnMap, orderedColumnIds } = stableData.current;
+			const sourceColumn = columnMap[orderedColumnIds[finishIndex]];
 
-							return () => setDraggableState(draggingState);
-						},
-					});
-				},
-				onDragStart() {
-					setDraggableState(draggingState);
-				},
-				onDrop() {
-					setDraggableState(idleState);
-				},
-			}),
-			dropTargetForElements({
-				element,
-				canDrop({ source }) {
-					return isItemData(source.data) && source.data.instanceId === instanceId;
-				},
-				getData({ input }) {
-					return attachClosestEdge(data, {
-						element,
-						input,
-						allowedEdges: ['top', 'bottom'],
-					});
-				},
-				onDrag({ self, source }) {
-					const isSource = source.element === element;
-					if (isSource) {
-						setClosestEdge(null);
-						return;
-					}
+			const entry = registry.getColumn(sourceColumn.columnId);
+			triggerPostMoveFlash(entry.element);
 
-					const closestEdge = extractClosestEdge(self.data);
+			liveRegion.announce(
+				`You've moved ${sourceColumn.title} from position ${
+					startIndex + 1
+				} to position ${finishIndex + 1} of ${orderedColumnIds.length}.`,
+			);
 
-					const sourceIndex = source.data.index;
-					invariant(typeof sourceIndex === 'number');
+			return;
+		}
 
-					const isItemBeforeSource = index === sourceIndex - 1;
-					const isItemAfterSource = index === sourceIndex + 1;
+		if (outcome.type === 'card-reorder') {
+			const { columnId, startIndex, finishIndex } = outcome;
 
-					const isDropIndicatorHidden =
-						(isItemBeforeSource && closestEdge === 'bottom') ||
-						(isItemAfterSource && closestEdge === 'top');
+			const { columnMap } = stableData.current;
+			const column = columnMap[columnId];
+			const item = column.items[finishIndex];
 
-					if (isDropIndicatorHidden) {
-						setClosestEdge(null);
-						return;
-					}
+			const entry = registry.getCard(item.userId);
+			triggerPostMoveFlash(entry.element);
 
-					setClosestEdge(closestEdge);
-				},
-				onDragLeave() {
-					setClosestEdge(null);
-				},
-				onDrop() {
-					setClosestEdge(null);
-				},
-			}),
-		);
-	}, [instanceId, item, index, registerItem]);
-
-	return (
-		<Fragment>
-			<Box ref={ref} xcss={listItemContainerStyles}>
-				<Grid
-					alignItems="center"
-					columnGap="space.050"
-					templateColumns="auto 1fr auto"
-					xcss={[
-						listItemStyles,
-						/**
-						 * We are applying the disabled effect to the inner element so that
-						 * the border and drop indicator are not affected.
-						 */
-						draggableState.type === 'dragging' && listItemDisabledStyles,
-					]}
-				>
-					<DropdownMenu
-						trigger={({ triggerRef, ...triggerProps }) => (
-							<DragHandleButton
-								ref={mergeRefs([dragHandleRef, triggerRef])}
-								{...triggerProps}
-								label={`Reorder ${item.label}`}
-							/>
-						)}
-					>
-						<DropdownItemGroup>
-							<DropDownContent position={position} index={index} />
-						</DropdownItemGroup>
-					</DropdownMenu>
-					<Box xcss={itemLabelStyles}>{item.label}</Box>
-					<Inline alignBlock="center" space="space.100">
-						<Badge>{1}</Badge>
-						<Avatar size="small" />
-						<Lozenge>Todo</Lozenge>
-					</Inline>
-				</Grid>
-				{closestEdge && <DropIndicator edge={closestEdge} gap="1px" />}
-			</Box>
-			{draggableState.type === 'preview' &&
-				ReactDOM.createPortal(
-					<Box xcss={listItemPreviewStyles}>{item.label}</Box>,
-					draggableState.container,
-				)}
-		</Fragment>
-	);
-}
-
-const defaultItems: Item[] = [
-	{
-		id: 'task-1',
-		label: 'Organize a team-building event',
-	},
-	{
-		id: 'task-2',
-		label: 'Create and maintain office inventory',
-	},
-	{
-		id: 'task-3',
-		label: 'Update company website content',
-	},
-	{
-		id: 'task-4',
-		label: 'Plan and execute marketing campaigns',
-	},
-	{
-		id: 'task-5',
-		label: 'Coordinate employee training sessions',
-	},
-	{
-		id: 'task-6',
-		label: 'Manage facility maintenance',
-	},
-	{
-		id: 'task-7',
-		label: 'Organize customer feedback surveys',
-	},
-	{
-		id: 'task-8',
-		label: 'Coordinate travel arrangements',
-	},
-];
-
-const containerStyles = xcss({
-	maxWidth: '400px',
-	borderWidth: 'border.width',
-	borderStyle: 'solid',
-	borderColor: 'color.border',
-});
-
-function getItemRegistry() {
-	const registry = new Map<string, HTMLElement>();
-
-	function register({ itemId, element }: ItemEntry) {
-		registry.set(itemId, element);
-
-		return function unregister() {
-			registry.delete(itemId);
-		};
-	}
-
-	function getElement(itemId: string): HTMLElement | null {
-		return registry.get(itemId) ?? null;
-	}
-
-	return { register, getElement };
-}
-
-type ListState = {
-	items: Item[];
-	lastCardMoved: {
-		item: Item;
-		previousIndex: number;
-		currentIndex: number;
-		numberOfItems: number;
-	} | null;
-};
-
-export default function ListExample() {
-	const [{ items, lastCardMoved }, setListState] = useState<ListState>({
-		items: defaultItems,
-		lastCardMoved: null,
-	});
-	const [registry] = useState(getItemRegistry);
-
-	// Isolated instances of this component from one another
-	const [instanceId] = useState(() => Symbol('instance-id'));
-
-	const reorderItem = useCallback(
-		({
-			startIndex,
-			indexOfTarget,
-			closestEdgeOfTarget,
-		}: {
-			startIndex: number;
-			indexOfTarget: number;
-			closestEdgeOfTarget: Edge | null;
-		}) => {
-			const finishIndex = getReorderDestinationIndex({
-				startIndex,
-				closestEdgeOfTarget,
-				indexOfTarget,
-				axis: 'vertical',
-			});
-
-			if (finishIndex === startIndex) {
-				// If there would be no change, we skip the update
+			if (trigger !== 'keyboard') {
 				return;
 			}
 
-			setListState((listState) => {
-				const item = listState.items[startIndex];
+			liveRegion.announce(
+				`You've moved ${item.name} from position ${
+					startIndex + 1
+				} to position ${finishIndex + 1} of ${column.items.length} in the ${column.title} column.`,
+			);
+
+			return;
+		}
+
+		if (outcome.type === 'card-move') {
+			const { finishColumnId, itemIndexInStartColumn, itemIndexInFinishColumn } = outcome;
+
+			const data = stableData.current;
+			const destinationColumn = data.columnMap[finishColumnId];
+			const item = destinationColumn.items[itemIndexInFinishColumn];
+
+			const finishPosition =
+				typeof itemIndexInFinishColumn === 'number'
+					? itemIndexInFinishColumn + 1
+					: destinationColumn.items.length;
+
+			const entry = registry.getCard(item.userId);
+			triggerPostMoveFlash(entry.element);
+
+			if (trigger !== 'keyboard') {
+				return;
+			}
+
+			liveRegion.announce(
+				`You've moved ${item.name} from position ${
+					itemIndexInStartColumn + 1
+				} to position ${finishPosition} in the ${destinationColumn.title} column.`,
+			);
+
+			/**
+			 * Because the card has moved column, it will have remounted.
+			 * This means we need to manually restore focus to it.
+			 */
+			entry.actionMenuTrigger.focus();
+
+			return;
+		}
+	}, [lastOperation, registry]);
+
+	useEffect(() => {
+		return liveRegion.cleanup();
+	}, []);
+
+	const getColumns = useCallback(() => {
+		const { columnMap, orderedColumnIds } = stableData.current;
+		return orderedColumnIds.map((columnId) => columnMap[columnId]);
+	}, []);
+
+	const reorderColumn = useCallback(
+		({
+			startIndex,
+			finishIndex,
+			trigger = 'keyboard',
+		}: {
+			startIndex: number;
+			finishIndex: number;
+			trigger?: Trigger;
+		}) => {
+			setData((data) => {
+				const outcome: Outcome = {
+					type: 'column-reorder',
+					columnId: data.orderedColumnIds[startIndex],
+					startIndex,
+					finishIndex,
+				};
 
 				return {
-					items: reorder({
-						list: listState.items,
+					...data,
+					orderedColumnIds: reorder({
+						list: data.orderedColumnIds,
 						startIndex,
 						finishIndex,
 					}),
-					lastCardMoved: {
-						item,
-						previousIndex: startIndex,
-						currentIndex: finishIndex,
-						numberOfItems: listState.items.length,
+					lastOperation: {
+						outcome,
+						trigger: trigger,
 					},
 				};
 			});
@@ -487,95 +194,269 @@ export default function ListExample() {
 		[],
 	);
 
-	useEffect(() => {
-		return monitorForElements({
-			canMonitor({ source }) {
-				return isItemData(source.data) && source.data.instanceId === instanceId;
-			},
-			onDrop({ location, source }) {
-				const target = location.current.dropTargets[0];
-				if (!target) {
-					return;
-				}
-
-				const sourceData = source.data;
-				const targetData = target.data;
-				if (!isItemData(sourceData) || !isItemData(targetData)) {
-					return;
-				}
-
-				const indexOfTarget = items.findIndex((item) => item.id === targetData.item.id);
-				if (indexOfTarget < 0) {
-					return;
-				}
-
-				const closestEdgeOfTarget = extractClosestEdge(targetData);
-
-				reorderItem({
-					startIndex: sourceData.index,
-					indexOfTarget,
-					closestEdgeOfTarget,
+	const reorderCard = useCallback(
+		({
+			columnId,
+			startIndex,
+			finishIndex,
+			trigger = 'keyboard',
+		}: {
+			columnId: string;
+			startIndex: number;
+			finishIndex: number;
+			trigger?: Trigger;
+		}) => {
+			setData((data) => {
+				const sourceColumn = data.columnMap[columnId];
+				const updatedItems = reorder({
+					list: sourceColumn.items,
+					startIndex,
+					finishIndex,
 				});
-			},
-		});
-	}, [instanceId, items, reorderItem]);
 
-	// once a drag is finished, we have some post drop actions to take
+				const updatedSourceColumn: ColumnType = {
+					...sourceColumn,
+					items: updatedItems,
+				};
+
+				const updatedMap: ColumnMap = {
+					...data.columnMap,
+					[columnId]: updatedSourceColumn,
+				};
+
+				const outcome: Outcome | null = {
+					type: 'card-reorder',
+					columnId,
+					startIndex,
+					finishIndex,
+				};
+
+				return {
+					...data,
+					columnMap: updatedMap,
+					lastOperation: {
+						trigger: trigger,
+						outcome,
+					},
+				};
+			});
+		},
+		[],
+	);
+
+	const moveCard = useCallback(
+		({
+			startColumnId,
+			finishColumnId,
+			itemIndexInStartColumn,
+			itemIndexInFinishColumn,
+			trigger = 'keyboard',
+		}: {
+			startColumnId: string;
+			finishColumnId: string;
+			itemIndexInStartColumn: number;
+			itemIndexInFinishColumn?: number;
+			trigger?: 'pointer' | 'keyboard';
+		}) => {
+			// invalid cross column movement
+			if (startColumnId === finishColumnId) {
+				return;
+			}
+			setData((data) => {
+				const sourceColumn = data.columnMap[startColumnId];
+				const destinationColumn = data.columnMap[finishColumnId];
+				const item: Person = sourceColumn.items[itemIndexInStartColumn];
+
+				const destinationItems = Array.from(destinationColumn.items);
+				// Going into the first position if no index is provided
+				const newIndexInDestination = itemIndexInFinishColumn ?? 0;
+				destinationItems.splice(newIndexInDestination, 0, item);
+
+				const updatedMap = {
+					...data.columnMap,
+					[startColumnId]: {
+						...sourceColumn,
+						items: sourceColumn.items.filter((i) => i.userId !== item.userId),
+					},
+					[finishColumnId]: {
+						...destinationColumn,
+						items: destinationItems,
+					},
+				};
+
+				const outcome: Outcome | null = {
+					type: 'card-move',
+					finishColumnId,
+					itemIndexInStartColumn,
+					itemIndexInFinishColumn: newIndexInDestination,
+				};
+
+				return {
+					...data,
+					columnMap: updatedMap,
+					lastOperation: {
+						outcome,
+						trigger: trigger,
+					},
+				};
+			});
+		},
+		[],
+	);
+
+	const [instanceId] = useState(() => Symbol('instance-id'));
+
 	useEffect(() => {
-		if (lastCardMoved === null) {
-			return;
-		}
+		return combine(
+			monitorForElements({
+				canMonitor({ source }) {
+					return source.data.instanceId === instanceId;
+				},
+				onDrop(args) {
+					const { location, source } = args;
+					// didn't drop on anything
+					if (!location.current.dropTargets.length) {
+						return;
+					}
+					// need to handle drop
 
-		const { item, previousIndex, currentIndex, numberOfItems } = lastCardMoved;
-		const element = registry.getElement(item.id);
-		if (element) {
-			triggerPostMoveFlash(element);
-		}
+					// 1. remove element from original position
+					// 2. move to new position
 
-		liveRegion.announce(
-			`You've moved ${item.label} from position ${
-				previousIndex + 1
-			} to position ${currentIndex + 1} of ${numberOfItems}.`,
+					if (source.data.type === 'column') {
+						const startIndex: number = data.orderedColumnIds.findIndex(
+							(columnId) => columnId === source.data.columnId,
+						);
+
+						const target = location.current.dropTargets[0];
+						const indexOfTarget: number = data.orderedColumnIds.findIndex(
+							(id) => id === target.data.columnId,
+						);
+						const closestEdgeOfTarget: Edge | null = extractClosestEdge(target.data);
+
+						const finishIndex = getReorderDestinationIndex({
+							startIndex,
+							indexOfTarget,
+							closestEdgeOfTarget,
+							axis: 'horizontal',
+						});
+
+						reorderColumn({ startIndex, finishIndex, trigger: 'pointer' });
+					}
+					// Dragging a card
+					if (source.data.type === 'card') {
+						const itemId = source.data.itemId;
+						invariant(typeof itemId === 'string');
+						// TODO: these lines not needed if item has columnId on it
+						const [, startColumnRecord] = location.initial.dropTargets;
+						const sourceId = startColumnRecord.data.columnId;
+						invariant(typeof sourceId === 'string');
+						const sourceColumn = data.columnMap[sourceId];
+						const itemIndex = sourceColumn.items.findIndex((item) => item.userId === itemId);
+
+						if (location.current.dropTargets.length === 1) {
+							const [destinationColumnRecord] = location.current.dropTargets;
+							const destinationId = destinationColumnRecord.data.columnId;
+							invariant(typeof destinationId === 'string');
+							const destinationColumn = data.columnMap[destinationId];
+							invariant(destinationColumn);
+
+							// reordering in same column
+							if (sourceColumn === destinationColumn) {
+								const destinationIndex = getReorderDestinationIndex({
+									startIndex: itemIndex,
+									indexOfTarget: sourceColumn.items.length - 1,
+									closestEdgeOfTarget: null,
+									axis: 'vertical',
+								});
+								reorderCard({
+									columnId: sourceColumn.columnId,
+									startIndex: itemIndex,
+									finishIndex: destinationIndex,
+									trigger: 'pointer',
+								});
+								return;
+							}
+
+							// moving to a new column
+							moveCard({
+								itemIndexInStartColumn: itemIndex,
+								startColumnId: sourceColumn.columnId,
+								finishColumnId: destinationColumn.columnId,
+								trigger: 'pointer',
+							});
+							return;
+						}
+
+						// dropping in a column (relative to a card)
+						if (location.current.dropTargets.length === 2) {
+							const [destinationCardRecord, destinationColumnRecord] = location.current.dropTargets;
+							const destinationColumnId = destinationColumnRecord.data.columnId;
+							invariant(typeof destinationColumnId === 'string');
+							const destinationColumn = data.columnMap[destinationColumnId];
+
+							const indexOfTarget = destinationColumn.items.findIndex(
+								(item) => item.userId === destinationCardRecord.data.itemId,
+							);
+							const closestEdgeOfTarget: Edge | null = extractClosestEdge(
+								destinationCardRecord.data,
+							);
+
+							// case 1: ordering in the same column
+							if (sourceColumn === destinationColumn) {
+								const destinationIndex = getReorderDestinationIndex({
+									startIndex: itemIndex,
+									indexOfTarget,
+									closestEdgeOfTarget,
+									axis: 'vertical',
+								});
+								reorderCard({
+									columnId: sourceColumn.columnId,
+									startIndex: itemIndex,
+									finishIndex: destinationIndex,
+									trigger: 'pointer',
+								});
+								return;
+							}
+
+							// case 2: moving into a new column relative to a card
+
+							const destinationIndex =
+								closestEdgeOfTarget === 'bottom' ? indexOfTarget + 1 : indexOfTarget;
+
+							moveCard({
+								itemIndexInStartColumn: itemIndex,
+								startColumnId: sourceColumn.columnId,
+								finishColumnId: destinationColumn.columnId,
+								itemIndexInFinishColumn: destinationIndex,
+								trigger: 'pointer',
+							});
+						}
+					}
+				},
+			}),
 		);
-	}, [lastCardMoved, registry]);
+	}, [data, instanceId, moveCard, reorderCard, reorderColumn]);
 
-	// cleanup the live region when this component is finished
-	useEffect(() => {
-		return function cleanup() {
-			liveRegion.cleanup();
-		};
-	}, []);
-
-	const getListLength = useCallback(() => items.length, [items.length]);
-
-	const contextValue: ListContextValue = useMemo(() => {
+	const contextValue: BoardContextValue = useMemo(() => {
 		return {
-			registerItem: registry.register,
-			reorderItem,
+			getColumns,
+			reorderColumn,
+			reorderCard,
+			moveCard,
+			registerCard: registry.registerCard,
+			registerColumn: registry.registerColumn,
 			instanceId,
-			getListLength,
 		};
-	}, [registry.register, reorderItem, instanceId, getListLength]);
+	}, [getColumns, reorderColumn, reorderCard, registry, moveCard, instanceId]);
 
 	return (
-		<ListContext.Provider value={contextValue}>
-			<Stack xcss={containerStyles}>
-				{/*
-          It is not expensive for us to pass `index` to items for this example,
-          as when reordering, only two items index will ever change.
-
-          If insertion or removal where allowed, it would be worth making
-          `index` a getter (eg `getIndex()`) to avoid re-rendering many items
-        */}
-				{items.map((item, index) => (
-					<ListItem
-						key={item.id}
-						item={item}
-						index={index}
-						position={getItemPosition({ index, items })}
-					/>
-				))}
-			</Stack>
-		</ListContext.Provider>
+		<BoardContext.Provider value={contextValue}>
+			<Board>
+				{data.orderedColumnIds.map((columnId) => {
+					return <Column column={data.columnMap[columnId]} key={columnId} />;
+				})}
+			</Board>
+		</BoardContext.Provider>
 	);
 }
